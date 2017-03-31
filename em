@@ -1,29 +1,22 @@
 #!/usr/bin/env python3.6
 
 import argparse
-import configparser
-import dbm
+import datetime
 import os
-import pprint
-import re
 import shelve
 import shutil
-import signal
-import subprocess
 import sys
-import time
 
-import daemon
 import pygit2
 
-def _die(msg):
+def _die(msg, status=1):
     print(msg, file=sys.stderr)
-    exit(1)
+    return status
 
 def _ensure_proj(cb):
     def docmd(*args, **kwargs):
         if not os.path.isfile('.em.db'):
-            _die(f'error: \'{os.path.abspath(".")}\' is not a project directory')
+            return _die(f'error: \'{os.path.abspath(".")}\' is not a project directory')
         cb(*args, **kwargs)
     return docmd
 
@@ -32,17 +25,18 @@ def proj_create(args, config, extra_args):
     try:
         pygit2.clone_repository(tmpl_repo, args.dest)
     except ValueError:
-        _die('error: project already exists')
+        return _die('error: project already exists')
 
     # re-init the repo
     shutil.rmtree(os.path.join(args.dest, '.git'), ignore_errors=True)
     repo = pygit2.init_repository(args.dest)
 
     shelve.open(os.path.join(args.dest, '.em')).close()
-    os.mkdir(os.path.join(args.dest, 'experiments'))
+    for d in ['experiments', 'data']:
+        os.mkdir(os.path.join(args.dest, d))
 
 def _cleanup(name, emdb, repo):
-    exper_dir = f'experiments/{name}'
+    exper_dir = os.path.join('experiments', name)
     if not name in emdb and not os.path.isdir(exper_dir):
         return
     shutil.rmtree(exper_dir, ignore_errors=True)
@@ -61,8 +55,12 @@ def _cleanup(name, emdb, repo):
     del emdb[name]
 
 UNCH = {pygit2.GIT_STATUS_CURRENT, pygit2.GIT_STATUS_IGNORED}
-
+def _tstamp(): return datetime.datetime.fromtimestamp(time.time())
 def run(args, config, prog_args):
+    import subprocess
+    import time
+    import daemon
+
     repo = pygit2.Repository('.')
 
     with shelve.open('.em', writeback=True) as emdb:
@@ -92,9 +90,9 @@ def run(args, config, prog_args):
     sig = repo.default_signature
     if br is not None:
         if br.is_checked_out():
-            _die('error: cannot run experiment on checked out branch')
+            return _die('error: cannot run experiment on checked out branch')
         if has_src_changes:
-            _die('error: not updating existing branch with source changes')
+            return _die('error: not updating existing branch with source changes')
         base_commit = br.target
         # libgit only creates worktree from head commit, so move to the branch
         saved_state = repo.stash(sig, include_untracked=True)
@@ -135,13 +133,15 @@ def run(args, config, prog_args):
                                    stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
             with shelve.open('.em', writeback=True) as emdb:
                 emdb[args.name] = {
-                    'created': time.time(),
+                    'started': _tstamp(),
                     'status': 'running',
                     'pid': job.pid,
                 }
+                if args.gpu:
+                    emdb[args.name]['gpu'] = ', '.join(args.gpu.split(','))
             job.wait()
             with shelve.open('.em', writeback=True) as emdb:
-                status = 'completed' if job.returncode == 0 else 'interrupted'
+                status = 'completed' if job.returncode == 0 else 'error'
                 emdb[args.name]['status'] = status
         except KeyboardInterrupt:
             with shelve.open('.em', writeback=True) as emdb:
@@ -149,6 +149,9 @@ def run(args, config, prog_args):
         finally:
             with shelve.open('.em', writeback=True) as emdb:
                 del emdb[args.name]['pid']
+                if 'gpu' in emdb[args.name]:
+                    del emdb[args.name]['gpu']
+                emdb[args.name]['ended'] = _tstamp()
 
     if args.bg:
         with daemon.DaemonContext(working_directory=os.path.abspath(os.curdir)):
@@ -163,27 +166,52 @@ def clean(args, config, extra_args):
         _cleanup(args.name, emdb, repo)
 
 def ls(args, config, extra_args):
+    filt = None
+    if args.filter:
+        fk, fv = args.filter.split('=')
+        filt = lambda x: fk in x and x[fk] == fv
+
     cols = shutil.get_terminal_size((80, 20)).columns
     with shelve.open('.em') as emdb:
-        linewidth = -1
-        line_names = []
-        names = sorted(emdb.keys())
+        if filt:
+            names = [name for name,stats in sorted(emdb.items()) if filt(stats)]
+        else:
+            names = sorted(emdb.keys())
         if not names:
-            exit()
-        for name in sorted(emdb.keys()):
-            if linewidth + len(name) >= cols:
-                linewidth = -1
-                sys.stdout.write('\n')
-            sys.stdout.write(f'{name} ')
-            linewidth += len(name) + 1
-        sys.stdout.write('\n')
-        sys.stdout.flush()
+            return
+
+    linewidth = -1
+    line_names = []
+    for name in names:
+        if linewidth + len(name) >= cols:
+            linewidth = -2
+            sys.stdout.write('\n')
+        sys.stdout.write(f'{name}  ')
+        linewidth += len(name) + 2
+    sys.stdout.write('\n')
+    sys.stdout.flush()
 
 def show(args, config, extra_args):
+    import pickle
+    import pprint
+
     with shelve.open('.em') as emdb:
         if not args.name in emdb:
-            _die(f'error: no experiment named \'{args.name}\'')
-        pprint.pprint(emdb[args.name])
+            return _die(f'error: no experiment named \'{args.name}\'')
+        for k,v in sorted(emdb[args.name].items()):
+            if isinstance(v, datetime.date):
+                v = v.ctime()
+            print(f'{k}: {v}')
+
+    if not args.opts:
+        return
+
+    run_dir = os.path.join('experiments', args.name, 'run')
+    with open(os.path.join(run_dir, 'opts.pkl'), 'rb') as f_opts:
+        print('\noptions:')
+        opts = pickle.load(f_opts)
+        cols = shutil.get_terminal_size((80, 20)).columns
+        pprint.pprint(vars(opts), indent=2, compact=True, width=cols)
 
 def _ps(pid):
     try:
@@ -193,18 +221,21 @@ def _ps(pid):
     return True
 
 def ctl(args, config, extra_args):
+    import signal
+
     with shelve.open('.em') as emdb:
         if not args.name in emdb:
-            _die(f'error: no experiment named \'{args.name}\'')
+            return _die(f'error: no experiment named \'{args.name}\'')
         pid = emdb[args.name].get('pid')
         if not pid or not _ps(pid):
-            _die(f'error: experiment \'{args.name}\' is not running')
+            return _die(f'error: experiment \'{args.name}\' is not running')
 
     cmd = args.cmd[0]
     if cmd == 'stop':
         os.kill(pid, signal.SIGINT)
     else:
-        with open(f'experiments/{args.name}/run/ctl', 'w') as f_ctl:
+        ctl_file = os.path.join('experiments', args.name, 'run', 'ctl')
+        with open(ctl_file) as f_ctl:
             print(' '.join(args.cmd), file=f_ctl)
 
 #===============================================================================
@@ -233,10 +264,13 @@ parser_clean.add_argument('name', help='the name of the experiment')
 parser_clean.set_defaults(_cmd=_ensure_proj(clean))
 
 parser_list = subparsers.add_parser('list', help='list experiments')
+parser_list.add_argument('--filter', '-f', help='filter experiments by <state>=<val>')
 parser_list.set_defaults(_cmd=_ensure_proj(ls))
 
 parser_show = subparsers.add_parser('show', help='show details about an experiment')
 parser_show.add_argument('name', help='the name of the experiment')
+parser_show.add_argument('--opts', '-o', action='store_true',
+                         help='also print runtime options')
 parser_show.set_defaults(_cmd=_ensure_proj(show))
 
 parser_ctl = subparsers.add_parser('ctl', help='control a running experiment')
@@ -263,6 +297,8 @@ config = {
 }
 
 try:
-    args._cmd(args, config, extra_args)
+    ret = args._cmd(args, config, extra_args)
 except KeyboardInterrupt:
     pass
+
+exit(ret)
