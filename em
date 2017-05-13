@@ -48,7 +48,7 @@ def _cleanup(name, emdb, repo):
     exper_dir = _expath(name)
     if name not in emdb and not os.path.isdir(exper_dir):
         return
-    shutil.rmtree(exper_dir, ignore_errors=True)
+    shutil.rmtree(exper_dir)
     try:
         worktree = repo.lookup_worktree(name)
         if worktree is not None:
@@ -61,7 +61,8 @@ def _cleanup(name, emdb, repo):
             br.delete()
     except pygit2.GitError:
         pass
-    del emdb[name]
+    if name in emdb:
+        del emdb[name]
 
 
 def _tstamp():
@@ -69,11 +70,55 @@ def _tstamp():
     return datetime.datetime.fromtimestamp(time.time())
 
 
-def run(args, config, prog_args):
+def _run_job(name, gpu=None, prog_args=[], bg=False):
     import socket
     import subprocess
     import daemon
 
+    exper_dir = _expath(name)
+
+    run_cmd = [config['experiment']['prog']] + \
+        config['experiment']['prog_args'] + \
+        prog_args
+    env = os.environ
+    if gpu:
+        env['CUDA_VISIBLE_DEVICES'] = gpu
+
+    def _do_run_job():
+        try:
+            job = subprocess.Popen(run_cmd, cwd=exper_dir, env=env,
+                                   stdin=sys.stdin, stdout=sys.stdout,
+                                   stderr=sys.stderr)
+            with shelve.open('.em', writeback=True) as emdb:
+                emdb[name] = {
+                    'started': _tstamp(),
+                    'status': 'running',
+                    'pid': job.pid,
+                    'hostname': socket.getfqdn(),
+                }
+                if gpu:
+                    emdb[name]['gpu'] = gpu
+            job.wait()
+            with shelve.open('.em', writeback=True) as emdb:
+                status = 'completed' if job.returncode == 0 else 'error'
+                emdb[name]['status'] = status
+        except KeyboardInterrupt:
+            with shelve.open('.em', writeback=True) as emdb:
+                emdb[name]['status'] = 'interrupted'
+        finally:
+            with shelve.open('.em', writeback=True) as emdb:
+                del emdb[name]['pid']
+                emdb[name]['ended'] = _tstamp()
+
+    if bg:
+        curdir = os.path.abspath(os.curdir)
+        with daemon.DaemonContext(working_directory=curdir):
+            _do_run_job()
+    else:
+        _do_run_job()
+
+
+def run(args, config, prog_args):
     UNCH = {pygit2.GIT_STATUS_CURRENT, pygit2.GIT_STATUS_IGNORED}
 
     name = args.name
@@ -136,47 +181,28 @@ def run(args, config, prog_args):
         repo.reset(head_commit.id, pygit2.GIT_RESET_HARD)
         repo.stash_pop()
 
-    run_cmd = [config['experiment']['prog']] + \
-        config['experiment']['prog_args'] + \
-        prog_args
-    env = os.environ
-    if args.gpu:
-        env['CUDA_VISIBLE_DEVICES'] = args.gpu
+    return _run_job(name, args.gpu, prog_args, args.bg)
 
-    def _run_job():
+
+def resume(args, config, prog_args):
+    name = args.name
+
+    repo = pygit2.Repository('.')
+
+    with shelve.open('.em') as emdb:
+        if name not in emdb:
+            return _die(f'error: no experiment named "{name}"')
+        info = emdb[name]
+        if 'pid' in info or info.get('status') == 'running':
+            return _die(f'error: experiment "{name}" is already running')
         try:
-            job = subprocess.Popen(run_cmd, cwd=exper_dir, env=env,
-                                   stdin=sys.stdin, stdout=sys.stdout,
-                                   stderr=sys.stderr)
-            with shelve.open('.em', writeback=True) as emdb:
-                emdb[name] = {
-                    'started': _tstamp(),
-                    'status': 'running',
-                    'pid': job.pid,
-                    'hostname': socket.getfqdn(),
-                }
-                if args.gpu:
-                    emdb[name]['gpu'] = args.gpu
-            job.wait()
-            with shelve.open('.em', writeback=True) as emdb:
-                status = 'completed' if job.returncode == 0 else 'error'
-                emdb[name]['status'] = status
-        except KeyboardInterrupt:
-            with shelve.open('.em', writeback=True) as emdb:
-                emdb[name]['status'] = 'interrupted'
-        finally:
-            with shelve.open('.em', writeback=True) as emdb:
-                del emdb[name]['pid']
-                if 'gpu' in emdb[name]:
-                    del emdb[name]['gpu']
-                emdb[name]['ended'] = _tstamp()
+            br = repo.lookup_branch(name)
+        except pygit2.GitError:
+            return _die(f'error: experiment "{name}" no longer exists')
 
-    if args.bg:
-        curdir = os.path.abspath(os.curdir)
-        with daemon.DaemonContext(working_directory=curdir):
-            _run_job()
-    else:
-        _run_job()
+    prog_args.extend(['--resume', args.epoch])
+
+    return _run_job(name, args.gpu, prog_args, args.bg)
 
 
 def clean(args, config, extra_args):
@@ -205,7 +231,7 @@ def ls(args, config, extra_args):
     linewidth = -1
     line_names = []
     for name in names:
-        if linewidth + len(name) >= cols:
+        if linewidth + len(name) + 2 >= cols:
             linewidth = -2
             sys.stdout.write('\n')
         sys.stdout.write(f'{name}  ')
@@ -256,16 +282,21 @@ def ctl(args, config, extra_args):
         if name not in emdb:
             return _die(f'error: no experiment named "{name}"')
         pid = emdb[name].get('pid')
-        if not pid or not _ps(pid):
-            return _die(f'error: experiment "{name}" is not running')
+        is_not_running = f'error: experiment "{name}" is not running'
+        if not pid:
+            return _die(is_not_running)
+        if not _ps(pid):
+            return _die(f'{is_not_running} on this machine')
 
     cmd = args.cmd[0]
     if cmd == 'stop':
         os.kill(pid, signal.SIGINT)
     else:
         ctl_file = _expath(name, 'run', 'ctl')
-        with open(ctl_file) as f_ctl:
+        print('opening file')
+        with open(ctl_file, 'w') as f_ctl:
             print(' '.join(args.cmd), file=f_ctl)
+            print(' '.join(args.cmd))
 
 
 def _get_br(repo, branch_name):
@@ -334,6 +365,15 @@ parser_run.add_argument('--gpu', '-g',
 parser_run.add_argument('--bg', action='store_true',
                         help='run the experiment in the background')
 parser_run.set_defaults(_cmd=_ensure_proj(run))
+
+parser_run = subparsers.add_parser('resume', help='resume an existing experiment')
+parser_run.add_argument('name', help='the name of the experiment')
+parser_run.add_argument('epoch', help='the epoch from which to resume')
+parser_run.add_argument('--gpu', '-g',
+                        help='comma separated id(s) of the gpu to use. none is all')
+parser_run.add_argument('--bg', action='store_true',
+                        help='resume the experiment into the background')
+parser_run.set_defaults(_cmd=_ensure_proj(resume))
 
 parser_clean = subparsers.add_parser('clean', help='clean up an experiment')
 parser_clean.add_argument('name', help='the name of the experiment')
