@@ -32,16 +32,19 @@ def proj_create(args, config, extra_args):
     tmpl_repo = config['project']['template_repo']
     try:
         pygit2.clone_repository(tmpl_repo, args.dest)
-    except ValueError:
-        return _die('error: project already exists')
 
-    # re-init the repo
-    shutil.rmtree(os.path.join(args.dest, '.git'), ignore_errors=True)
-    repo = pygit2.init_repository(args.dest)
+        # delete history of template
+        shutil.rmtree(os.path.join(args.dest, '.git'), ignore_errors=True)
+        repo = pygit2.init_repository(args.dest)
+    except ValueError:
+        pass  # already in a repo
+
+    for d in ['experiments', 'data']:
+        dpath = os.path.join(args.dest, d)
+        if not os.path.isdir(dpath):
+            os.mkdir(dpath)
 
     shelve.open(os.path.join(args.dest, '.em')).close()
-    for d in ['experiments', 'data']:
-        os.mkdir(os.path.join(args.dest, d))
 
 
 def _cleanup(name, emdb, repo):
@@ -126,6 +129,8 @@ def run(args, config, prog_args):
 
     with shelve.open('.em', writeback=True) as emdb:
         if name in emdb:
+            if emdb[name]['status'] == 'running':
+                return _die(f'error: experiment {name} is currently running.')
             newp = input(f'Experiment {name} already exists. Recreate? [yN] ')
             if newp.lower() != 'y':
                 exit()
@@ -209,6 +214,12 @@ def clean(args, config, extra_args):
     repo = pygit2.Repository('.')
 
     with shelve.open('.em', writeback=True) as emdb:
+        if args.name not in emdb:
+            return
+        info = emdb[args.name]
+        if not args.force and ('pid' in info or info.get('status') == 'running'):
+            return _die(f'error: experiment "{args.name}" is currently running')
+
         _cleanup(args.name, emdb, repo)
 
 
@@ -366,6 +377,11 @@ parser_run.add_argument('--bg', action='store_true',
                         help='run the experiment in the background')
 parser_run.set_defaults(_cmd=_ensure_proj(run))
 
+parser_ctl = subparsers.add_parser('ctl', help='control a running experiment')
+parser_ctl.add_argument('name', help='the name of the experiment')
+parser_ctl.add_argument('cmd', nargs='+', help='the control signal to send')
+parser_ctl.set_defaults(_cmd=_ensure_proj(ctl))
+
 parser_run = subparsers.add_parser('resume', help='resume an existing experiment')
 parser_run.add_argument('name', help='the name of the experiment')
 parser_run.add_argument('epoch', help='the epoch from which to resume')
@@ -374,10 +390,6 @@ parser_run.add_argument('--gpu', '-g',
 parser_run.add_argument('--bg', action='store_true',
                         help='resume the experiment into the background')
 parser_run.set_defaults(_cmd=_ensure_proj(resume))
-
-parser_clean = subparsers.add_parser('clean', help='clean up an experiment')
-parser_clean.add_argument('name', help='the name of the experiment')
-parser_clean.set_defaults(_cmd=_ensure_proj(clean))
 
 parser_list = subparsers.add_parser('list', aliases=['ls'], help='list experiments')
 parser_list.add_argument('--filter', '-f', help='filter experiments by <state>=<val>')
@@ -389,10 +401,10 @@ parser_show.add_argument('--opts', action='store_true',
                          help='also print runtime options')
 parser_show.set_defaults(_cmd=_ensure_proj(show))
 
-parser_ctl = subparsers.add_parser('ctl', help='control a running experiment')
-parser_ctl.add_argument('name', help='the name of the experiment')
-parser_ctl.add_argument('cmd', nargs='+', help='the control signal to send')
-parser_ctl.set_defaults(_cmd=_ensure_proj(ctl))
+parser_clean = subparsers.add_parser('clean', help='clean up an experiment')
+parser_clean.add_argument('name', help='the name of the experiment')
+parser_clean.add_argument('--force', '-f', action='store_true')
+parser_clean.set_defaults(_cmd=_ensure_proj(clean))
 
 parser_ctl = subparsers.add_parser('rename', aliases=['mv'],
                                    help='rename an experiment')
