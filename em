@@ -51,7 +51,10 @@ def _cleanup(name, emdb, repo):
     exper_dir = _expath(name)
     if name not in emdb and not os.path.isdir(exper_dir):
         return
-    shutil.rmtree(exper_dir)
+    try:
+        shutil.rmtree(exper_dir)
+    except:
+        pass
     try:
         worktree = repo.lookup_worktree(name)
         if worktree is not None:
@@ -133,7 +136,7 @@ def run(args, config, prog_args):
                 return _die(f'error: experiment {name} is currently running.')
             newp = input(f'Experiment {name} already exists. Recreate? [yN] ')
             if newp.lower() != 'y':
-                exit()
+                return
             _cleanup(name, emdb, repo)
             br = None
 
@@ -211,16 +214,43 @@ def resume(args, config, prog_args):
 
 
 def clean(args, config, extra_args):
+    import fnmatch
     repo = pygit2.Repository('.')
 
     with shelve.open('.em', writeback=True) as emdb:
-        if args.name not in emdb:
+        matched = set()
+        needs_force = set()
+        for exp in emdb:
+            # if not name_re.search(exp):
+            if not fnmatch.fnmatch(exp, args.name):
+                continue
+            matched.add(exp)
+            info = emdb[exp]
+            if 'pid' in info or info.get('status') == 'running':
+                needs_force.add(exp)
+        if not matched:
             return
-        info = emdb[args.name]
-        if not args.force and ('pid' in info or info.get('status') == 'running'):
-            return _die(f'error: experiment "{args.name}" is currently running')
+        clean_noforce = matched - needs_force
+        to_clean = clean_noforce if not args.force else matched
+        if args.name in emdb and args.name in to_clean:
+            _cleanup(args.name, emdb, repo)
+            return
 
-        _cleanup(args.name, emdb, repo)
+        if to_clean:
+            print('The following experiments will be removed:')
+            print('\n'.join(['* ' + n for n in sorted(clean_noforce)]))
+            if args.force:
+                print('\n'.join(['* ' + n + ' (running)' for n in sorted(needs_force)]))
+        if needs_force and not args.force:
+            print('The following experiments require --force to be removed:')
+            print('\n'.join(['* ' + n for n in sorted(needs_force)]))
+
+
+        cleanp = input(f'Clean up {len(to_clean)} experiments? [yN] ')
+        if cleanp.lower() != 'y':
+            return
+        for name in to_clean:
+            _cleanup(name, emdb, repo)
 
 
 def ls(args, config, extra_args):
