@@ -163,7 +163,8 @@ def run(args, config, prog_args):
     repo = pygit2.Repository('.')
 
     with shelve.open('.em', writeback=True) as emdb:
-        if name in emdb:
+        exp_names = set(emdb)
+        if name in exp_names:
             if emdb[name]['status'] == 'running':
                 return _die(f'error: experiment {name} is currently running.')
             newp = input(f'Experiment {name} already exists. Recreate? [yN] ')
@@ -179,37 +180,56 @@ def run(args, config, prog_args):
 
     tracked_exts = set(config['experiment']['track_files'].split(','))
     has_src_changes = has_changes = False
-    for path, status in repo.status().items():
-        ext = path.splitext(path.basename(path))[1][1:]
+    for filepath, status in repo.status().items():
+        ext = path.splitext(path.basename(filepath))[1][1:]
         changed = status not in GIT_UNCH
         has_changes = has_changes or changed
         if ext in tracked_exts:
             has_src_changes = has_src_changes or changed
 
-    saved_state = None
+    snap_tree_ci = None  # existing commit for `snap_tree`
+    if has_src_changes:
+        repo.index.add_all([f'*.{ext}' for ext in tracked_exts])
+        snap_tree = repo.index.write_tree()  # an Oid
+
     base_commit = head_commit = repo.head.target   # an Oid
     sig = repo.default_signature
-    if br is not None:
+
+    if has_src_changes:
+        with shelve.open('.em') as emdb:
+            for existing_name in emdb:
+                existing_br = repo.lookup_branch(existing_name)
+                if existing_br is None:
+                    continue
+                existing_ci = existing_br.get_object()
+                if existing_ci and existing_ci.tree_id == snap_tree:
+                    base_commit = existing_ci.id
+                    break
+
+    if br is not None:  # turn existing branch into an experiment
         if br.is_checked_out():
             return _die(E_CHECKED_OUT)
         if has_src_changes:
             return _die(E_MODIFIED_SRC)
         base_commit = br.target
-        # libgit only creates worktree from head commit, so move to the branch
-        saved_state = repo.stash(sig, include_untracked=True)
-        repo.reset(base_commit, pygit2.GIT_RESET_HARD)
         br.delete()
         br = None
+
+    if base_commit != head_commit:
+        # libgit only creates worktrees from head commit, so reset to the base
+        saved_state = None
+        if has_src_changes:
+            saved_state = repo.stash(sig, include_untracked=True)
+        repo.reset(base_commit, pygit2.GIT_RESET_HARD)
 
     exper_dir = _expath(name)
     repo.add_worktree(name, exper_dir)
 
-    if has_src_changes:
-        repo.index.add_all([f'*.{ext}' for ext in tracked_exts])
-        snap_tree = repo.index.write_tree()  # an Oid
-        repo.create_commit(f'refs/heads/{name}', sig, sig,
-                           f'setup experiment: {name}', snap_tree,
-                           [base_commit])
+    if has_src_changes and base_commit == head_commit:
+        # create a snapshot and move the worktree branch to it
+        msg = args.desc or 'setup experiment'
+        repo.create_commit(f'refs/heads/{name}', sig, sig, msg,
+                           snap_tree, [base_commit])
         # update the workdir to match updated index
         workdir = pygit2.Repository(exper_dir)
         workdir.reset(workdir.head.target, pygit2.GIT_RESET_HARD)
@@ -217,9 +237,10 @@ def run(args, config, prog_args):
     os.symlink(path.abspath('data'), path.join(exper_dir, 'data'),
                target_is_directory=True)
 
-    if saved_state is not None:
-        repo.reset(head_commit.id, pygit2.GIT_RESET_HARD)
-        repo.stash_pop()
+    if base_commit != head_commit:
+        if saved_state:
+            repo.stash_pop()
+        repo.reset(head_commit, pygit2.GIT_RESET_HARD)
 
     return _run_job(name, args.gpu, prog_args, args.bg)
 
@@ -446,6 +467,8 @@ if __name__ == '__main__':
                             help='CSV ids of gpus to use. none = all')
     parser_run.add_argument('--bg', action='store_true',
                             help='run the experiment in the background')
+    parser_run.add_argument('--desc',
+                            help='a short description of any source changes')
     parser_run.set_defaults(_cmd=_ensure_proj(run))
 
     parser_ctl = subparsers.add_parser('ctl',
@@ -480,7 +503,7 @@ if __name__ == '__main__':
     parser_clean = subparsers.add_parser('clean', help='clean up an experiment')
     parser_clean.add_argument('name', nargs='+',
                               help='patterns of experiments to remove')
-    parser_clean.add_argument('--exclude', '-e', nargs='+',
+    parser_clean.add_argument('--exclude', '-e', nargs='+', default=[],
                               help='patterns of experiments to keep')
     parser_clean.add_argument('--force', '-f', action='store_true')
     parser_clean.add_argument('--snaps', '-s', action='store_true',
