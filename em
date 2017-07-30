@@ -28,7 +28,7 @@ E_RENAME_RUNNING = 'error: cannot rename running experiment'
 LI = '* {}'
 CLEAN_NEEDS_FORCE = 'The following experiments require --force to be removed:'
 CLEAN_PREAMBLE = 'The following experiments will be removed:'
-CLEAN_PROMPT = 'Clean up {d} experiments? [yN] '
+CLEAN_PROMPT = 'Clean up {:d} experiments? [yN] '
 LI_RUNNING = LI + ' (running)'
 
 
@@ -233,16 +233,21 @@ def resume(args, config, prog_args):
     return _run_job(name, args.gpu, prog_args, args.bg)
 
 
+def _print_sorted(l, tmpl=LI):
+    print('\n'.join(map(tmpl.format, sorted(l))))
+
+
 def clean(args, config, extra_args):
-    import fnmatch
+    from fnmatch import fnmatch
     repo = pygit2.Repository('.')
 
     with shelve.open('.em', writeback=True) as emdb:
         matched = set()
         needs_force = set()
         for exp in emdb:
-            # if not name_re.search(exp):
-            if not fnmatch.fnmatch(exp, args.name):
+            is_match = sum(fnmatch(exp, patt) for patt in args.name)
+            is_excluded = sum(fnmatch(exp, patt) for patt in args.exclude)
+            if not is_match or is_excluded:
                 continue
             matched.add(exp)
             info = emdb[exp]
@@ -252,21 +257,18 @@ def clean(args, config, extra_args):
             return
         clean_noforce = matched - needs_force
         to_clean = clean_noforce if not args.force else matched
-        if args.name in emdb and args.name in to_clean:
-            _cleanup(args.name, emdb, repo)
+        if len(args.name) == 1 and args.name[0] in to_clean:
+            _cleanup(args.name[0], emdb, repo)
             return
-
-        def print_sorted(l, tmpl=LI):
-            print('\n'.join(map(tmpl.format, sorted(l))))
 
         if to_clean:
             print(CLEAN_PREAMBLE)
-            print_sorted(clean_noforce)
+            _print_sorted(clean_noforce)
             if args.force:
-                print_sorted(needs_force, tmpl=LI_RUNNING)
+                _print_sorted(needs_force, tmpl=LI_RUNNING)
         if needs_force and not args.force:
             print(CLEAN_NEEDS_FORCE)
-            print_sorted(needs_force)
+            _print_sorted(needs_force)
 
         if not to_clean:
             return
@@ -458,7 +460,10 @@ if __name__ == '__main__':
     parser_show.set_defaults(_cmd=_ensure_proj(show))
 
     parser_clean = subparsers.add_parser('clean', help='clean up an experiment')
-    parser_clean.add_argument('name', help='pattern of experiments to remove')
+    parser_clean.add_argument('name', nargs='+',
+                              help='patterns of experiments to remove')
+    parser_clean.add_argument('--exclude', '-e', nargs='+',
+                              help='patterns of experiments to keep')
     parser_clean.add_argument('--force', '-f', action='store_true')
     parser_clean.set_defaults(_cmd=_ensure_proj(clean))
 
