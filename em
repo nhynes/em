@@ -10,6 +10,28 @@ import sys
 import pygit2
 
 
+GIT_UNCH = {pygit2.GIT_STATUS_CURRENT, pygit2.GIT_STATUS_IGNORED}
+
+E_BRANCH_EXISTS = 'error: branch "{}" already exists'
+E_CHECKED_OUT = 'error: cannot run experiment on checked out branch'
+E_IS_RUNNING = 'error: experiment "{}" is already running'
+E_MODIFIED_SRC = 'error: not updating existing branch with source changes'
+E_MOVE_DIR = 'error: could not move experiment directory'
+E_NAME_EXISTS = 'error: experiment named "{}" already exists'
+E_NO_BRANCH = 'error: no branch for experiment "{}"?'
+E_NO_EXIST = 'error: experiment "{}" no longer exists'
+E_NO_EXP = 'error: no experiment named "{}"'
+E_OTHER_MACHINE = 'error: experiment "{}" is not running on this machine'
+E_RENAME_BRANCH = 'error: could not rename branch'
+E_RENAME_RUNNING = 'error: cannot rename running experiment'
+
+LI = '* {}'
+CLEAN_NEEDS_FORCE = 'The following experiments require --force to be removed:'
+CLEAN_PREAMBLE = 'The following experiments will be removed:'
+CLEAN_PROMPT = 'Clean up {d} experiments? [yN] '
+LI_RUNNING = LI + ' (running)'
+
+
 def _die(msg, status=1):
     print(msg, file=sys.stderr)
     return status
@@ -125,8 +147,6 @@ def _run_job(name, gpu=None, prog_args=[], bg=False):
 
 
 def run(args, config, prog_args):
-    UNCH = {pygit2.GIT_STATUS_CURRENT, pygit2.GIT_STATUS_IGNORED}
-
     name = args.name
     repo = pygit2.Repository('.')
 
@@ -149,19 +169,19 @@ def run(args, config, prog_args):
     has_src_changes = has_changes = False
     for path, status in repo.status().items():
         ext = os.path.splitext(os.path.basename(path))[1][1:]
-        changed = status not in UNCH
+        changed = status not in GIT_UNCH
         has_changes = has_changes or changed
         if ext in tracked_exts:
             has_src_changes = has_src_changes or changed
 
     saved_state = None
-    base_commit = head_commit = repo.head.target  # an Oid
+    base_commit = head_commit = repo.head.target   # an Oid
     sig = repo.default_signature
     if br is not None:
         if br.is_checked_out():
-            return _die('error: cannot run experiment on checked out branch')
+            return _die(E_CHECKED_OUT)
         if has_src_changes:
-            return _die('error: not updating existing branch with source changes')
+            return _die(E_MODIFIED_SRC)
         base_commit = br.target
         # libgit only creates worktree from head commit, so move to the branch
         saved_state = repo.stash(sig, include_untracked=True)
@@ -199,14 +219,14 @@ def resume(args, config, prog_args):
 
     with shelve.open('.em') as emdb:
         if name not in emdb:
-            return _die(f'error: no experiment named "{name}"')
+            return _die(E_NO_EXP.format(name))
         info = emdb[name]
         if 'pid' in info or info.get('status') == 'running':
-            return _die(f'error: experiment "{name}" is already running')
+            return _die(E_IS_RUNNING.format(name))
         try:
             br = repo.lookup_branch(name)
         except pygit2.GitError:
-            return _die(f'error: experiment "{name}" no longer exists')
+            return _die(E_NO_EXISTformat(name))
 
     prog_args.extend(['--resume', args.epoch])
 
@@ -236,17 +256,22 @@ def clean(args, config, extra_args):
             _cleanup(args.name, emdb, repo)
             return
 
+        def print_sorted(l, tmpl=LI):
+            print('\n'.join(map(tmpl.format, sorted(l))))
+
         if to_clean:
-            print('The following experiments will be removed:')
-            print('\n'.join(['* ' + n for n in sorted(clean_noforce)]))
+            print(CLEAN_PREAMBLE)
+            print_sorted(clean_noforce)
             if args.force:
-                print('\n'.join(['* ' + n + ' (running)' for n in sorted(needs_force)]))
+                print_sorted(needs_force, tmpl=LI_RUNNING)
         if needs_force and not args.force:
-            print('The following experiments require --force to be removed:')
-            print('\n'.join(['* ' + n for n in sorted(needs_force)]))
+            print(CLEAN_NEEDS_FORCE)
+            print_sorted(needs_force)
 
+        if not to_clean:
+            return
 
-        cleanp = input(f'Clean up {len(to_clean)} experiments? [yN] ')
+        cleanp = input(CLEAN_PROMPT.format(len(to_clean)))
         if cleanp.lower() != 'y':
             return
         for name in to_clean:
@@ -275,7 +300,7 @@ def ls(args, config, extra_args):
         if linewidth + len(name) + 2 >= cols:
             linewidth = -2
             sys.stdout.write('\n')
-        sys.stdout.write(f'{name}  ')
+        sys.stdout.write(f'{name}    ')
         linewidth += len(name) + 2
     sys.stdout.write('\n')
     sys.stdout.flush()
@@ -289,7 +314,7 @@ def show(args, config, extra_args):
 
     with shelve.open('.em') as emdb:
         if name not in emdb:
-            return _die(f'error: no experiment named "{name}"')
+            return _die(E_NO_EXP.format(name))
         for k, v in sorted(emdb[name].items()):
             if isinstance(v, datetime.date):
                 v = v.ctime()
@@ -321,23 +346,20 @@ def ctl(args, config, extra_args):
 
     with shelve.open('.em') as emdb:
         if name not in emdb:
-            return _die(f'error: no experiment named "{name}"')
+            return _die(E_NO_EXP.format(name))
         pid = emdb[name].get('pid')
-        is_not_running = f'error: experiment "{name}" is not running'
         if not pid:
             return _die(is_not_running)
         if not _ps(pid):
-            return _die(f'{is_not_running} on this machine')
+            return _die(E_OTHER_MACHINE.format(name))
 
     cmd = args.cmd[0]
     if cmd == 'stop':
         os.kill(pid, signal.SIGINT)
     else:
         ctl_file = _expath(name, 'run', 'ctl')
-        print('opening file')
         with open(ctl_file, 'w') as f_ctl:
             print(' '.join(args.cmd), file=f_ctl)
-            print(' '.join(args.cmd))
 
 
 def _get_br(repo, branch_name):
@@ -357,30 +379,30 @@ def rename(args, config, extra_args):
 
     with shelve.open('.em') as emdb:
         if name not in emdb:
-            return _die(f'error: no experiment named "{name}"')
+            return _die(E_NO_EXP.format(name))
         if emdb[name]['status'] == 'running':
-            return _die(f'error: cannot rename running experiment')
+            return _die(E_RENAME_RUNNING)
         if new_name in emdb:
-            return _die(f'error: experiment named "{new_name}" already exists')
+            return _die(E_NAME_EXISTS.format(new_name))
 
     br = _get_br(repo, name)
     if br is None:
-        return _die(f'error: no branch for experiment "{name}"?')
+        return _die(E_NO_BRANCH.format(name))
     if _get_br(repo, new_name) is not None:
-        return _die(f'error: branch "{new_name}" already exists')
+        return _die(E_BRANCH_EXISTS.format(new_name))
 
     exper_dir = _expath(name)
     new_exper_dir = _expath(new_name)
     try:
         os.rename(exper_dir, new_exper_dir)
     except:
-        return _die('error: could not move experiment directory')
+        return _die(E_MOVE_DIR)
 
     try:
         br.rename(new_name)
     except pygit2.GitError:
         os.rename(new_exper_dir, exper_dir)
-        return _die(f'error: could not rename branch')
+        return _die(E_RENAME_BRANCH)
 
     with shelve.open('.em') as emdb:
         emdb[new_name] = emdb[name]
@@ -388,81 +410,85 @@ def rename(args, config, extra_args):
 
 # ==============================================================================
 
-if __name__ != '__main__':
-    exit()
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+            description='Manage projects and experiments.')
+    parser.add_argument('--config', '-c', help='path to config file')
+    subparsers = parser.add_subparsers()
 
-parser = argparse.ArgumentParser(description='Manage projects and experiments.')
-parser.add_argument('--config', '-c', help='path to config file')
-subparsers = parser.add_subparsers()
+    parser_create = subparsers.add_parser('proj', help='create a new project')
+    parser_create.add_argument('dest', help='the project destination')
+    parser_create.set_defaults(_cmd=proj_create)
 
-parser_create = subparsers.add_parser('proj', help='create a new project')
-parser_create.add_argument('dest', help='the project destination')
-parser_create.set_defaults(_cmd=proj_create)
+    parser_run = subparsers.add_parser('run', help='run an experiment')
+    parser_run.add_argument('name', help='the name of the experiment')
+    parser_run.add_argument('--gpu', '-g',
+                            help='CSV ids of gpus to use. none = all')
+    parser_run.add_argument('--bg', action='store_true',
+                            help='run the experiment in the background')
+    parser_run.set_defaults(_cmd=_ensure_proj(run))
 
-parser_run = subparsers.add_parser('run', help='run an experiment')
-parser_run.add_argument('name', help='the name of the experiment')
-parser_run.add_argument('--gpu', '-g',
-                        help='comma separated id(s) of the gpu to use. none is all')
-parser_run.add_argument('--bg', action='store_true',
-                        help='run the experiment in the background')
-parser_run.set_defaults(_cmd=_ensure_proj(run))
+    parser_ctl = subparsers.add_parser('ctl',
+                                       help='control a running experiment')
+    parser_ctl.add_argument('name', help='the name of the experiment')
+    parser_ctl.add_argument('cmd', nargs='+', help='the control signal to send')
+    parser_ctl.set_defaults(_cmd=_ensure_proj(ctl))
 
-parser_ctl = subparsers.add_parser('ctl', help='control a running experiment')
-parser_ctl.add_argument('name', help='the name of the experiment')
-parser_ctl.add_argument('cmd', nargs='+', help='the control signal to send')
-parser_ctl.set_defaults(_cmd=_ensure_proj(ctl))
+    parser_run = subparsers.add_parser('resume',
+                                       help='resume existing experiment')
+    parser_run.add_argument('name', help='the name of the experiment')
+    parser_run.add_argument('epoch', help='the epoch from which to resume')
+    parser_run.add_argument('--gpu', '-g',
+                            help='CSV ids of gpus to use. none = all')
+    parser_run.add_argument('--bg', action='store_true',
+                            help='resume the experiment into the background')
+    parser_run.set_defaults(_cmd=_ensure_proj(resume))
 
-parser_run = subparsers.add_parser('resume', help='resume an existing experiment')
-parser_run.add_argument('name', help='the name of the experiment')
-parser_run.add_argument('epoch', help='the epoch from which to resume')
-parser_run.add_argument('--gpu', '-g',
-                        help='comma separated id(s) of the gpu to use. none is all')
-parser_run.add_argument('--bg', action='store_true',
-                        help='resume the experiment into the background')
-parser_run.set_defaults(_cmd=_ensure_proj(resume))
+    parser_list = subparsers.add_parser('list', aliases=['ls'],
+                                        help='list experiments')
+    parser_list.add_argument('--filter', '-f',
+                             help='filter experiments by <state>=<val>')
+    parser_list.set_defaults(_cmd=_ensure_proj(ls))
 
-parser_list = subparsers.add_parser('list', aliases=['ls'], help='list experiments')
-parser_list.add_argument('--filter', '-f', help='filter experiments by <state>=<val>')
-parser_list.set_defaults(_cmd=_ensure_proj(ls))
+    parser_show = subparsers.add_parser('show',
+                                        help='show details about an experiment')
+    parser_show.add_argument('name', help='the name of the experiment')
+    parser_show.add_argument('--opts', action='store_true',
+                             help='also print runtime options')
+    parser_show.set_defaults(_cmd=_ensure_proj(show))
 
-parser_show = subparsers.add_parser('show', help='show details about an experiment')
-parser_show.add_argument('name', help='the name of the experiment')
-parser_show.add_argument('--opts', action='store_true',
-                         help='also print runtime options')
-parser_show.set_defaults(_cmd=_ensure_proj(show))
+    parser_clean = subparsers.add_parser('clean', help='clean up an experiment')
+    parser_clean.add_argument('name', help='pattern of experiments to remove')
+    parser_clean.add_argument('--force', '-f', action='store_true')
+    parser_clean.set_defaults(_cmd=_ensure_proj(clean))
 
-parser_clean = subparsers.add_parser('clean', help='clean up an experiment')
-parser_clean.add_argument('name', help='the name of the experiment')
-parser_clean.add_argument('--force', '-f', action='store_true')
-parser_clean.set_defaults(_cmd=_ensure_proj(clean))
+    parser_ctl = subparsers.add_parser('rename', aliases=['mv'],
+                                       help='rename an experiment')
+    parser_ctl.add_argument('name', help='the name of the experiment')
+    parser_ctl.add_argument('newname', help='the new name of the experiment')
+    parser_ctl.set_defaults(_cmd=_ensure_proj(rename))
 
-parser_ctl = subparsers.add_parser('rename', aliases=['mv'],
-                                   help='rename an experiment')
-parser_ctl.add_argument('name', help='the name of the experiment')
-parser_ctl.add_argument('newname', help='the new name of the experiment')
-parser_ctl.set_defaults(_cmd=_ensure_proj(rename))
+    if len(sys.argv) == 1:
+        parser.print_usage()
+        exit()
 
-if len(sys.argv) == 1:
-    parser.print_usage()
-    exit()
+    args, extra_args = parser.parse_known_args()
 
-args, extra_args = parser.parse_known_args()
+    # eventually upgrade to configparser
+    config = {
+        'project': {
+            'template_repo': 'https://github.com/nhynes/pytorch-proj.git',
+        },
+        'experiment': {
+            'track_files': 'py,sh,txt',
+            'prog': sys.executable,
+            'prog_args': ['main.py'],
+        },
+    }
 
-# eventually upgrade to configparser
-config = {
-    'project': {
-        'template_repo': 'https://github.com/nhynes/pytorch-proj.git',
-    },
-    'experiment': {
-        'track_files': 'py,sh,txt',
-        'prog': sys.executable,
-        'prog_args': ['main.py'],
-    },
-}
+    try:
+        ret = args._cmd(args, config, extra_args)
+    except KeyboardInterrupt:
+        ret = 0
 
-try:
-    ret = args._cmd(args, config, extra_args)
-except KeyboardInterrupt:
-    ret = 0
-
-exit(ret)
+    exit(ret)
