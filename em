@@ -1,5 +1,6 @@
 #!/usr/bin/env python3.6
 
+from os import path
 import argparse
 import datetime
 import os
@@ -14,6 +15,7 @@ GIT_UNCH = {pygit2.GIT_STATUS_CURRENT, pygit2.GIT_STATUS_IGNORED}
 
 E_BRANCH_EXISTS = 'error: branch "{}" already exists'
 E_CHECKED_OUT = 'error: cannot run experiment on checked out branch'
+E_CANT_CLEAN = 'error: could not clean up {}'
 E_IS_RUNNING = 'error: experiment "{}" is already running'
 E_MODIFIED_SRC = 'error: not updating existing branch with source changes'
 E_MOVE_DIR = 'error: could not move experiment directory'
@@ -28,7 +30,9 @@ E_RENAME_RUNNING = 'error: cannot rename running experiment'
 LI = '* {}'
 CLEAN_NEEDS_FORCE = 'The following experiments require --force to be removed:'
 CLEAN_PREAMBLE = 'The following experiments will be removed:'
+CLEAN_SNAP_PREAMBLE = 'The following experiments\' snaps will be removed:'
 CLEAN_PROMPT = 'Clean up {:d} experiments? [yN] '
+CLEAN_SNAPS_PROMPT = 'Clean up snaps of {:d} experiments? [yN] '
 LI_RUNNING = LI + ' (running)'
 
 
@@ -39,15 +43,15 @@ def _die(msg, status=1):
 
 def _ensure_proj(cb):
     def docmd(*args, **kwargs):
-        if not os.path.isfile('.em.db'):
-            curdir = os.path.abspath('.')
+        if not path.isfile('.em.db'):
+            curdir = path.abspath('.')
             return _die(f'error: "{curdir}" is not a project directory')
         cb(*args, **kwargs)
     return docmd
 
 
 def _expath(*args):
-    return os.path.abspath(os.path.join('experiments', *args))
+    return path.abspath(path.join('experiments', *args))
 
 
 def proj_create(args, config, extra_args):
@@ -56,22 +60,22 @@ def proj_create(args, config, extra_args):
         pygit2.clone_repository(tmpl_repo, args.dest)
 
         # delete history of template
-        shutil.rmtree(os.path.join(args.dest, '.git'), ignore_errors=True)
+        shutil.rmtree(path.join(args.dest, '.git'), ignore_errors=True)
         repo = pygit2.init_repository(args.dest)
     except ValueError:
         pass  # already in a repo
 
     for d in ['experiments', 'data']:
-        dpath = os.path.join(args.dest, d)
-        if not os.path.isdir(dpath):
+        dpath = path.join(args.dest, d)
+        if not path.isdir(dpath):
             os.mkdir(dpath)
 
-    shelve.open(os.path.join(args.dest, '.em')).close()
+    shelve.open(path.join(args.dest, '.em')).close()
 
 
 def _cleanup(name, emdb, repo):
     exper_dir = _expath(name)
-    if name not in emdb and not os.path.isdir(exper_dir):
+    if name not in emdb and not path.isdir(exper_dir):
         return
     try:
         shutil.rmtree(exper_dir)
@@ -91,6 +95,14 @@ def _cleanup(name, emdb, repo):
         pass
     if name in emdb:
         del emdb[name]
+
+
+def _cleanup_snaps(name, emdb, repo):
+    exper_dir = _expath(name)
+    snaps_dir = path.join(exper_dir, 'run', 'snaps')
+    if path.isdir(snaps_dir):
+        shutil.rmtree(snaps_dir)
+        os.mkdir(snaps_dir)
 
 
 def _tstamp():
@@ -139,7 +151,7 @@ def _run_job(name, gpu=None, prog_args=[], bg=False):
                 emdb[name]['ended'] = _tstamp()
 
     if bg:
-        curdir = os.path.abspath(os.curdir)
+        curdir = path.abspath(os.curdir)
         with daemon.DaemonContext(working_directory=curdir):
             _do_run_job()
     else:
@@ -168,7 +180,7 @@ def run(args, config, prog_args):
     tracked_exts = set(config['experiment']['track_files'].split(','))
     has_src_changes = has_changes = False
     for path, status in repo.status().items():
-        ext = os.path.splitext(os.path.basename(path))[1][1:]
+        ext = path.splitext(path.basename(path))[1][1:]
         changed = status not in GIT_UNCH
         has_changes = has_changes or changed
         if ext in tracked_exts:
@@ -202,7 +214,7 @@ def run(args, config, prog_args):
         workdir = pygit2.Repository(exper_dir)
         workdir.reset(workdir.head.target, pygit2.GIT_RESET_HARD)
 
-    os.symlink(os.path.abspath('data'), os.path.join(exper_dir, 'data'),
+    os.symlink(path.abspath('data'), path.join(exper_dir, 'data'),
                target_is_directory=True)
 
     if saved_state is not None:
@@ -241,28 +253,30 @@ def clean(args, config, extra_args):
     from fnmatch import fnmatch
     repo = pygit2.Repository('.')
 
+    cleanup = _cleanup_snaps if args.snaps else _cleanup
+
     with shelve.open('.em', writeback=True) as emdb:
         matched = set()
         needs_force = set()
-        for exp in emdb:
-            is_match = sum(fnmatch(exp, patt) for patt in args.name)
-            is_excluded = sum(fnmatch(exp, patt) for patt in args.exclude)
+        for name in emdb:
+            is_match = sum(fnmatch(name, patt) for patt in args.name)
+            is_excluded = sum(fnmatch(name, patt) for patt in args.exclude)
             if not is_match or is_excluded:
                 continue
-            matched.add(exp)
-            info = emdb[exp]
+            matched.add(name)
+            info = emdb[name]
             if 'pid' in info or info.get('status') == 'running':
-                needs_force.add(exp)
+                needs_force.add(name)
         if not matched:
             return
         clean_noforce = matched - needs_force
         to_clean = clean_noforce if not args.force else matched
         if len(args.name) == 1 and args.name[0] in to_clean:
-            _cleanup(args.name[0], emdb, repo)
+            cleanup(args.name[0], emdb, repo)
             return
 
         if to_clean:
-            print(CLEAN_PREAMBLE)
+            print(CLEAN_SNAP_PREAMBLE if args.snaps else CLEAN_PREAMBLE)
             _print_sorted(clean_noforce)
             if args.force:
                 _print_sorted(needs_force, tmpl=LI_RUNNING)
@@ -273,11 +287,15 @@ def clean(args, config, extra_args):
         if not to_clean:
             return
 
-        cleanp = input(CLEAN_PROMPT.format(len(to_clean)))
+        prompt = CLEAN_SNAPS_PROMPT if args.snaps else CLEAN_PROMPT
+        cleanp = input(prompt.format(len(to_clean)))
         if cleanp.lower() != 'y':
             return
         for name in to_clean:
-            _cleanup(name, emdb, repo)
+            try:
+                cleanup(name, emdb, repo)
+            except OSError:
+                print(E_CANT_CLEAN.format(name))
 
 
 def ls(args, config, extra_args):
@@ -465,6 +483,8 @@ if __name__ == '__main__':
     parser_clean.add_argument('--exclude', '-e', nargs='+',
                               help='patterns of experiments to keep')
     parser_clean.add_argument('--force', '-f', action='store_true')
+    parser_clean.add_argument('--snaps', '-s', action='store_true',
+                              help='just empty snaps directory?')
     parser_clean.set_defaults(_cmd=_ensure_proj(clean))
 
     parser_ctl = subparsers.add_parser('rename', aliases=['mv'],
