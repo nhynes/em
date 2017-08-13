@@ -27,6 +27,8 @@ E_OTHER_MACHINE = 'error: experiment "{}" is not running on this machine'
 E_RENAME_BRANCH = 'error: could not rename branch'
 E_RENAME_RUNNING = 'error: cannot rename running experiment'
 
+RUN_RECREATE_PROMPT = 'Experiment {} already exists. Recreate? [yN] '
+
 LI = '* {}'
 CLEAN_NEEDS_FORCE = 'The following experiments require --force to be removed:'
 CLEAN_PREAMBLE = 'The following experiments will be removed:'
@@ -77,10 +79,8 @@ def _cleanup(name, emdb, repo):
     exper_dir = _expath(name)
     if name not in emdb and not path.isdir(exper_dir):
         return
-    try:
+    if os.path.isdir(exper_dir):
         shutil.rmtree(exper_dir)
-    except:
-        pass
     try:
         worktree = repo.lookup_worktree(name)
         if worktree is not None:
@@ -163,15 +163,16 @@ def run(args, config, prog_args):
     repo = pygit2.Repository('.')
 
     with shelve.open('.em', writeback=True) as emdb:
-        exp_names = set(emdb)
-        if name in exp_names:
-            if emdb[name]['status'] == 'running':
-                return _die(f'error: experiment {name} is currently running.')
-            newp = input(f'Experiment {name} already exists. Recreate? [yN] ')
+        exp_info = emdb.get(name)
+        if exp_info:
+            if exp_info['status'] == 'running':
+                return _die(E_IS_RUNNING.format(name))
+            newp = input(RUN_RECREATE_PROMPT.format(name))
             if newp.lower() != 'y':
                 return
             _cleanup(name, emdb, repo)
             br = None
+        emdb[name] = {}
 
         try:
             br = repo.lookup_branch(name)
@@ -215,12 +216,10 @@ def run(args, config, prog_args):
         br.delete()
         br = None
 
-    if base_commit != head_commit:
-        # libgit only creates worktrees from head commit, so reset to the base
-        saved_state = None
-        if has_src_changes:
-            saved_state = repo.stash(sig, include_untracked=True)
-        repo.reset(base_commit, pygit2.GIT_RESET_HARD)
+    saved_state = None
+    if has_src_changes:
+        saved_state = repo.stash(sig, include_untracked=True)
+    repo.reset(base_commit, pygit2.GIT_RESET_HARD)
 
     exper_dir = _expath(name)
     repo.add_worktree(name, exper_dir)
@@ -237,10 +236,9 @@ def run(args, config, prog_args):
     os.symlink(path.abspath('data'), path.join(exper_dir, 'data'),
                target_is_directory=True)
 
-    if base_commit != head_commit:
-        if saved_state:
-            repo.stash_pop()
-        repo.reset(head_commit, pygit2.GIT_RESET_HARD)
+    repo.reset(head_commit, pygit2.GIT_RESET_HARD)
+    if saved_state:
+        repo.stash_pop()
 
     return _run_job(name, args.gpu, prog_args, args.bg)
 
