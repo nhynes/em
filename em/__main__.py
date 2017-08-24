@@ -150,7 +150,7 @@ def _run_job(name, config, gpu=None, prog_args=None, background=False):
                 emdb[name]['status'] = 'interrupted'
         finally:
             with shelve.open('.em', writeback=True) as emdb:
-                del emdb[name]['pid']
+                emdb[name].pop('pid')
                 emdb[name]['ended'] = _tstamp()
 
     if background:
@@ -177,7 +177,7 @@ def run(args, config, prog_args):
                 return
             _cleanup(name, emdb, repo)
             br = None
-        emdb[name] = {}
+        emdb[name] = {'status': 'starting'}
 
         try:
             br = repo.lookup_branch(name)
@@ -455,11 +455,11 @@ def rename(args, _config, _extra_args):
         return _die(E_RENAME_BRANCH)
 
     with shelve.open('.em') as emdb:
-        emdb[new_name] = emdb[name]
-        del emdb[name]
+        emdb[new_name] = emdb.pop(name)
 
 
 def main():
+    # pylint: disable=too-many-statements
     """Runs the program."""
     parser = argparse.ArgumentParser(
         description='Manage projects and experiments.')
