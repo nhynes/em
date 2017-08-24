@@ -213,6 +213,7 @@ def run(args, config, prog_args):
                     base_commit = existing_ci.id
                     break
 
+    stash = None
     if br is not None:  # turn existing branch into an experiment
         if br.is_checked_out():
             return _die(E_CHECKED_OUT)
@@ -221,11 +222,13 @@ def run(args, config, prog_args):
         base_commit = br.target
         br.delete()
         br = None
+        if has_src_changes:  # save state to not contaminate existing br
+            stash = repo.stash(sig, include_untracked=True)
+            print('stashing')
 
-    saved_state = None
-    if has_src_changes:
-        saved_state = repo.stash(sig, include_untracked=True)
-    repo.reset(base_commit, pygit2.GIT_RESET_HARD)
+    if base_commit != head_commit:
+        repo.reset(base_commit,
+                   pygit2.GIT_RESET_HARD if stash else pygit2.GIT_RESET_SOFT)
 
     exper_dir = _expath(name)
     repo.add_worktree(name, exper_dir)
@@ -242,9 +245,11 @@ def run(args, config, prog_args):
     os.symlink(os.path.abspath('data'), os.path.join(exper_dir, 'data'),
                target_is_directory=True)
 
-    repo.reset(head_commit, pygit2.GIT_RESET_HARD)
-    if saved_state:
-        repo.stash_pop()
+    if base_commit != head_commit:
+        repo.reset(head_commit,
+                   pygit2.GIT_RESET_HARD if stash else pygit2.GIT_RESET_SOFT)
+        if stash:
+            repo.stash_pop()
 
     return _run_job(name, config, args.gpu, prog_args, args.background)
 
