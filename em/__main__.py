@@ -35,6 +35,8 @@ CLEAN_SNAP_PREAMBLE = 'The following experiments\' snaps will be removed:'
 CLEAN_PROMPT = 'Clean up {:d} experiments? [yN] '
 CLEAN_SNAPS_PROMPT = 'Clean up snaps of {:d} experiments? [yN] '
 LI_RUNNING = LI + ' (running)'
+RESET_PREAMBLE = 'The following experiments will be reset:'
+RESET_PROMPT = 'Reset {:d} experiments? [yN] '
 
 
 def _die(msg, status=1):
@@ -323,6 +325,39 @@ def clean(args, _config, _extra_args):
                 print(E_CANT_CLEAN.format(name))
 
 
+def reset(args, _config, _extra_args):
+    """Reset the state of [glitched] experiments."""
+    from fnmatch import fnmatch
+
+    with shelve.open('.em', writeback=True) as emdb:
+        def _reset(name):
+            for state_item in ['pid', 'gpu']:
+                del emdb[name][state_item]
+            emdb[name]['status'] = 'reset'
+
+        if len(args.name) == 1 and args.name[0] in emdb:  # non-globbed
+            _reset(args.name[0])
+            return
+
+        to_reset = set()
+        for name in emdb:
+            is_match = sum(fnmatch(name, patt) for patt in args.name)
+            is_excluded = sum(fnmatch(name, patt) for patt in args.exclude)
+            if not is_match or is_excluded:
+                continue
+            to_reset.add(name)
+        if not to_reset:
+            return
+
+        print(RESET_PREAMBLE)
+        _print_sorted(to_reset)
+        resetp = input(RESET_PROMPT.format(len(to_reset)))
+        if resetp.lower() != 'y':
+            return
+        for name in to_reset:
+            _reset(name)
+
+
 def list_experiments(args, _config, _extra_args):
     """List experiments."""
     if args.filter:
@@ -520,6 +555,14 @@ def main():
     parser_clean.add_argument('--snaps', '-s', action='store_true',
                               help='just empty snaps directory?')
     parser_clean.set_defaults(em_cmd=_ensure_proj(clean))
+
+    parser_clean = subparsers.add_parser('reset',
+                                         help='reset glitched experiments')
+    parser_clean.add_argument('name', nargs='+',
+                              help='patterns of experiments to reset')
+    parser_clean.add_argument('--exclude', '-e', nargs='+', default=[],
+                              help='patterns of experiments to keep')
+    parser_clean.set_defaults(em_cmd=_ensure_proj(reset))
 
     parser_ctl = subparsers.add_parser('rename', aliases=['mv'],
                                        help='rename an experiment')
