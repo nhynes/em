@@ -20,7 +20,6 @@ E_MODIFIED_SRC = 'error: not updating existing branch with source changes'
 E_MOVE_DIR = 'error: could not move experiment directory'
 E_NAME_EXISTS = 'error: experiment named "{}" already exists'
 E_NO_BRANCH = 'error: no branch for experiment "{}"?'
-E_NO_EXIST = 'error: experiment "{}" no longer exists'
 E_NO_EXP = 'error: no experiment named "{}"'
 E_OTHER_MACHINE = 'error: experiment "{}" is not running on this machine'
 E_RENAME_BRANCH = 'error: could not rename branch'
@@ -115,6 +114,73 @@ def _tstamp():
     return datetime.datetime.fromtimestamp(time.time())
 
 
+def _has_src_changes(repo, config):
+    tracked_exts = set(config['experiment']['track_files'].split(','))
+    has_src_changes = has_changes = False
+    for filepath, status in repo.status().items():
+        ext = os.path.splitext(os.path.basename(filepath))[1][1:]
+        changed = status not in GIT_UNCH
+        has_changes = has_changes or changed
+        if ext in tracked_exts:
+            has_src_changes = has_src_changes or changed
+    return has_src_changes
+
+
+def _create_experiment(name, repo, config, base_commit=None, desc=None):
+    head_commit = repo[repo.head.target]
+    stash = None
+    sig = repo.default_signature
+
+    has_src_changes = _has_src_changes(repo, config)
+
+    if has_src_changes:
+        tracked_exts = set(config['experiment']['track_files'].split(','))
+        repo.index.add_all([f'*.{ext}' for ext in tracked_exts])
+        snap_tree_id = repo.index.write_tree()  # an Oid
+
+        if base_commit is not None:
+            if base_commit.tree_id != snap_tree_id:
+                stash = repo.stash(sig, include_untracked=True)
+        else:  # look for identical experiment commit
+            base_commit = head_commit
+            with shelve.open('.em') as emdb:
+                for existing_name in emdb:
+                    existing_br = repo.lookup_branch(existing_name)
+                    if existing_br is None:
+                        continue
+                    existing_ci = existing_br.get_object()
+                    if existing_ci and existing_ci.tree_id == snap_tree_id:
+                        base_commit = existing_ci
+                        break
+    else:
+        base_commit = head_commit
+
+    if base_commit != head_commit:
+        repo.reset(base_commit.id,
+                   pygit2.GIT_RESET_HARD if stash else pygit2.GIT_RESET_SOFT)
+
+    exper_dir = _expath(name)
+    repo.add_worktree(name, exper_dir)
+
+    if has_src_changes and base_commit == head_commit:
+        # create a snapshot and move the worktree branch to it
+        msg = desc or 'setup experiment'
+        repo.create_commit(f'refs/heads/{name}', sig, sig, msg,
+                           snap_tree_id, [base_commit.id])
+        # update the workdir to match updated index
+        workdir = pygit2.Repository(exper_dir)
+        workdir.reset(workdir.head.target, pygit2.GIT_RESET_HARD)
+
+    os.symlink(os.path.abspath('data'), os.path.join(exper_dir, 'data'),
+               target_is_directory=True)
+
+    if base_commit != head_commit:
+        repo.reset(head_commit.id,
+                   pygit2.GIT_RESET_HARD if stash else pygit2.GIT_RESET_SOFT)
+        if stash:
+            repo.stash_pop()
+
+
 def _run_job(name, config, gpu=None, prog_args=None, background=False):
     import socket
     import subprocess
@@ -152,7 +218,7 @@ def _run_job(name, config, gpu=None, prog_args=None, background=False):
                 emdb[name]['status'] = 'interrupted'
         finally:
             with shelve.open('.em', writeback=True) as emdb:
-                emdb[name].pop('pid')
+                emdb[name].pop('pid', None)
                 emdb[name]['ended'] = _tstamp()
 
     if background:
@@ -165,7 +231,6 @@ def _run_job(name, config, gpu=None, prog_args=None, background=False):
 
 def run(args, config, prog_args):
     """Run an experiment."""
-    # pylint: disable=too-many-locals,too-many-branches,too-many-statements
     name = args.name
     repo = pygit2.Repository('.')
 
@@ -186,72 +251,67 @@ def run(args, config, prog_args):
         except pygit2.GitError:
             br = None
 
-    tracked_exts = set(config['experiment']['track_files'].split(','))
-    has_src_changes = has_changes = False
-    for filepath, status in repo.status().items():
-        ext = os.path.splitext(os.path.basename(filepath))[1][1:]
-        changed = status not in GIT_UNCH
-        has_changes = has_changes or changed
-        if ext in tracked_exts:
-            has_src_changes = has_src_changes or changed
-
-    if has_src_changes:
-        repo.index.add_all([f'*.{ext}' for ext in tracked_exts])
-        snap_tree = repo.index.write_tree()  # an Oid
-
-    base_commit = head_commit = repo.head.target   # an Oid
-    sig = repo.default_signature
-
-    if has_src_changes:
-        with shelve.open('.em') as emdb:
-            for existing_name in emdb:
-                existing_br = repo.lookup_branch(existing_name)
-                if existing_br is None:
-                    continue
-                existing_ci = existing_br.get_object()
-                if existing_ci and existing_ci.tree_id == snap_tree:
-                    base_commit = existing_ci.id
-                    break
-
-    stash = None
-    if br is not None:  # turn existing branch into an experiment
+    base_commit = None
+    if br is not None:
         if br.is_checked_out():
             return _die(E_CHECKED_OUT)
-        if has_src_changes:
-            return _die(E_MODIFIED_SRC)
-        base_commit = br.target
+        base_commit = repo[br.target]
         br.delete()
-        br = None
-        if has_src_changes:  # save state to not contaminate existing br
-            stash = repo.stash(sig, include_untracked=True)
-            print('stashing')
 
-    if base_commit != head_commit:
-        repo.reset(base_commit,
-                   pygit2.GIT_RESET_HARD if stash else pygit2.GIT_RESET_SOFT)
-
-    exper_dir = _expath(name)
-    repo.add_worktree(name, exper_dir)
-
-    if has_src_changes and base_commit == head_commit:
-        # create a snapshot and move the worktree branch to it
-        msg = args.desc or 'setup experiment'
-        repo.create_commit(f'refs/heads/{name}', sig, sig, msg,
-                           snap_tree, [base_commit])
-        # update the workdir to match updated index
-        workdir = pygit2.Repository(exper_dir)
-        workdir.reset(workdir.head.target, pygit2.GIT_RESET_HARD)
-
-    os.symlink(os.path.abspath('data'), os.path.join(exper_dir, 'data'),
-               target_is_directory=True)
-
-    if base_commit != head_commit:
-        repo.reset(head_commit,
-                   pygit2.GIT_RESET_HARD if stash else pygit2.GIT_RESET_SOFT)
-        if stash:
-            repo.stash_pop()
+    _create_experiment(name, repo, config, base_commit, desc=args.desc)
 
     return _run_job(name, config, args.gpu, prog_args, args.background)
+
+
+def fork(args, config, prog_args):
+    """Fork an experiment."""
+    name = args.name
+    fork_name = args.fork_name
+    repo = pygit2.Repository('.')
+
+    with shelve.open('.em', writeback=True) as emdb:
+        if fork_name in emdb:
+            return _die(E_NAME_EXISTS.format(fork_name))
+
+        exp_info = emdb.get(name)
+        if not exp_info:
+            return _die(E_NO_EXP.format(name))
+
+        try:
+            fork_br = repo.lookup_branch(fork_name)
+            if fork_br is not None:
+                return _die(E_BRANCH_EXISTS.format(fork_name))
+        except pygit2.GitError:
+            pass
+
+        try:
+            br = repo.lookup_branch(name)
+        except pygit2.GitError:
+            br = None
+        if br is None:
+            return _die(E_NO_BRANCH.format(name))
+
+        emdb[fork_name] = {
+            'status': 'starting',
+            'clone_of': name,
+        }
+
+    base_commit = repo[br.target]
+    _create_experiment(fork_name, repo, config, base_commit)
+
+    orig_dir = _expath(name)
+    fork_dir = _expath(fork_name)
+    fork_snap_dir = os.path.join(fork_dir, 'run', 'snaps')
+    os.makedirs(fork_snap_dir)
+
+    def _link(*path_comps):
+        orig_path = os.path.join(orig_dir, *path_comps)
+        os.symlink(orig_path, orig_path.replace(name, fork_name))
+
+    _link('run', 'opts.pkl')
+    orig_snap_dir = fork_snap_dir.replace(fork_name, name)
+    for snap_name in os.listdir(orig_snap_dir):
+        _link('run', 'snaps', snap_name)
 
 
 def resume(args, config, prog_args):
@@ -269,7 +329,7 @@ def resume(args, config, prog_args):
         try:
             repo.lookup_branch(name)
         except pygit2.GitError:
-            return _die(E_NO_EXIST.format(name))
+            return _die(E_NO_EXP.format(name))
 
     prog_args.extend(['--resume', args.epoch])
 
@@ -337,7 +397,7 @@ def reset(args, _config, _extra_args):
     with shelve.open('.em', writeback=True) as emdb:
         def _reset(name):
             for state_item in ['pid', 'gpu']:
-                del emdb[name][state_item]
+                emdb[name].pop(state_item, None)
             emdb[name]['status'] = 'reset'
 
         if len(args.name) == 1 and args.name[0] in emdb:  # non-globbed
@@ -506,9 +566,11 @@ def main():
     parser.add_argument('--config', '-c', help='path to config file')
     subparsers = parser.add_subparsers()
 
+
     parser_create = subparsers.add_parser('proj', help='create a new project')
     parser_create.add_argument('dest', help='the project destination')
     parser_create.set_defaults(em_cmd=proj_create)
+
 
     parser_run = subparsers.add_parser('run', help='run an experiment')
     parser_run.add_argument('name', help='the name of the experiment')
@@ -520,12 +582,20 @@ def main():
                             help='a short description of any source changes')
     parser_run.set_defaults(em_cmd=_ensure_proj(run))
 
+
+    parser_run = subparsers.add_parser('fork', help='fork an experiment')
+    parser_run.add_argument('name', help='the name of the experiment to clone')
+    parser_run.add_argument('fork_name', help='the name of the cloned experiment')
+    parser_run.set_defaults(em_cmd=_ensure_proj(fork))
+
+
     parser_ctl = subparsers.add_parser('ctl',
                                        help='control a running experiment')
     parser_ctl.add_argument('name', help='the name of the experiment')
     parser_ctl.add_argument('cmd', nargs='+',
                             help='the control signal to send')
     parser_ctl.set_defaults(em_cmd=_ensure_proj(ctl))
+
 
     parser_run = subparsers.add_parser('resume',
                                        help='resume existing experiment')
@@ -536,6 +606,7 @@ def main():
     parser_run.add_argument('--background', '-bg', action='store_true',
                             help='resume the experiment into the background')
     parser_run.set_defaults(em_cmd=_ensure_proj(resume))
+
 
     parser_list = subparsers.add_parser('list', aliases=['ls'],
                                         help='list experiments')
@@ -550,6 +621,7 @@ def main():
                              help='also print runtime options')
     parser_show.set_defaults(em_cmd=_ensure_proj(show))
 
+
     parser_clean = subparsers.add_parser('clean',
                                          help='clean up an experiment')
     parser_clean.add_argument('name', nargs='+',
@@ -561,6 +633,7 @@ def main():
                               help='just empty snaps directory?')
     parser_clean.set_defaults(em_cmd=_ensure_proj(clean))
 
+
     parser_clean = subparsers.add_parser('reset',
                                          help='reset glitched experiments')
     parser_clean.add_argument('name', nargs='+',
@@ -569,11 +642,13 @@ def main():
                               help='patterns of experiments to keep')
     parser_clean.set_defaults(em_cmd=_ensure_proj(reset))
 
+
     parser_ctl = subparsers.add_parser('rename', aliases=['mv'],
                                        help='rename an experiment')
     parser_ctl.add_argument('name', help='the name of the experiment')
     parser_ctl.add_argument('newname', help='the new name of the experiment')
     parser_ctl.set_defaults(em_cmd=_ensure_proj(rename))
+
 
     if len(sys.argv) == 1:
         parser.print_usage()
