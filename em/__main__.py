@@ -11,6 +11,8 @@ import pygit2
 
 GIT_UNCH = {pygit2.GIT_STATUS_CURRENT, pygit2.GIT_STATUS_IGNORED}
 
+EM_KEY = '__em__'
+
 E_BRANCH_EXISTS = 'error: branch "{}" already exists'
 E_CHECKED_OUT = 'error: cannot run experiment on checked out branch'
 E_CANT_CLEAN = 'error: could not clean up {}'
@@ -21,6 +23,7 @@ E_MOVE_DIR = 'error: could not move experiment directory'
 E_NAME_EXISTS = 'error: experiment named "{}" already exists'
 E_NO_BRANCH = 'error: no branch for experiment "{}"?'
 E_NO_EXP = 'error: no experiment named "{}"'
+E_NO_PROJ = 'error: "{}" is not a project directory'
 E_OTHER_MACHINE = 'error: experiment "{}" is not running on this machine'
 E_RENAME_BRANCH = 'error: could not rename branch'
 E_RENAME_RUNNING = 'error: cannot rename running experiment'
@@ -45,9 +48,10 @@ def _die(msg, status=1):
 
 def _ensure_proj(cb):
     def _docmd(*args, **kwargs):
-        if not os.path.isfile('.em.db'):
-            curdir = os.path.abspath('.')
-            return _die(f'error: "{curdir}" is not a project directory')
+        with shelve.open('.em') as emdb:
+            if EM_KEY not in emdb:
+                curdir = os.path.abspath('.')
+                return _die(E_NO_PROJ.format(curdir))
         cb(*args, **kwargs)
     return _docmd
 
@@ -73,7 +77,8 @@ def proj_create(args, config, _extra_args):
         if not os.path.isdir(dpath):
             os.mkdir(dpath)
 
-    shelve.open(os.path.join(args.dest, '.em')).close()
+    with shelve.open(os.path.join(args.dest, '.em')) as emdb:
+        emdb['__em__'] = {}
 
 
 def _cleanup(name, emdb, repo):
@@ -351,6 +356,8 @@ def clean(args, _config, _extra_args):
         matched = set()
         needs_force = set()
         for name in emdb:
+            if name == EM_KEY:
+                continue
             is_match = sum(fnmatch(name, patt) for patt in args.name)
             is_excluded = sum(fnmatch(name, patt) for patt in args.exclude)
             if not is_match or is_excluded:
@@ -434,15 +441,16 @@ def list_experiments(args, _config, _extra_args):
     cols = shutil.get_terminal_size((80, 20)).columns
     with shelve.open('.em') as emdb:
         if args.filter:
-            names = [name
-                     for name, info in sorted(emdb.items()) if _filt(info)]
+            names = {name
+                     for name, info in sorted(emdb.items()) if _filt(info)}
         else:
-            names = sorted(emdb.keys())
+            names = emdb.keys()
+        names -= {EM_KEY}
         if not names:
             return
 
     linewidth = -1
-    for name in names:
+    for name in sorted(names):
         if linewidth + len(name) + 2 >= cols:
             linewidth = -2
             sys.stdout.write('\n')
@@ -460,7 +468,7 @@ def show(args, _config, _extra_args):
     name = args.name
 
     with shelve.open('.em') as emdb:
-        if name not in emdb:
+        if name not in emdb or name == EM_KEY:
             return _die(E_NO_EXP.format(name))
         for info_name, info_val in sorted(emdb[name].items()):
             if isinstance(info_val, datetime.date):

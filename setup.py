@@ -38,7 +38,7 @@ setup(
 
     install_requires=[
         'pygit2>=0.26.0',
-        'daemon',
+        'python-daemon',
     ],
 
     entry_points={
