@@ -336,7 +336,9 @@ def resume(args, config, prog_args):
         except pygit2.GitError:
             return _die(E_NO_EXP.format(name))
 
-    prog_args.extend(['--resume', args.epoch])
+    prog_args.append('--resume')
+    if args.epoch:
+        prog_args.append(args.epoch)
 
     return _run_job(name, config, args.gpu, prog_args, args.background)
 
@@ -432,32 +434,8 @@ def reset(args, _config, _extra_args):
 
 def list_experiments(args, _config, _extra_args):
     """List experiments."""
-    if args.filter:
-        filter_key, filter_value = args.filter.split('=')
-
-        def _filt(stats):
-            return filter_key in stats and stats[filter_key] == filter_value
-
-    cols = shutil.get_terminal_size((80, 20)).columns
-    with shelve.open('.em') as emdb:
-        if args.filter:
-            names = {name
-                     for name, info in sorted(emdb.items()) if _filt(info)}
-        else:
-            names = emdb.keys()
-        names -= {EM_KEY}
-        if not names:
-            return
-
-    linewidth = -1
-    for name in sorted(names):
-        if linewidth + len(name) + 2 >= cols:
-            linewidth = -2
-            sys.stdout.write('\n')
-        sys.stdout.write(f'{name}    ')
-        linewidth += len(name) + 2
-    sys.stdout.write('\n')
-    sys.stdout.flush()
+    import subprocess
+    subprocess.call(['ls', 'experiments'] + _extra_args)
 
 
 def show(args, _config, _extra_args):
@@ -608,7 +586,7 @@ def main():
     parser_run = subparsers.add_parser('resume',
                                        help='resume existing experiment')
     parser_run.add_argument('name', help='the name of the experiment')
-    parser_run.add_argument('epoch', help='the epoch from which to resume')
+    parser_run.add_argument('--epoch', help='the epoch from which to resume')
     parser_run.add_argument('--gpu', '-g',
                             help='CSV ids of gpus to use. none = all')
     parser_run.add_argument('--background', '-bg', action='store_true',
