@@ -2,6 +2,7 @@
 import argparse
 import datetime
 import os
+from os import path as osp
 import shelve
 import shutil
 import sys
@@ -50,14 +51,14 @@ def _ensure_proj(cb):
     def _docmd(*args, **kwargs):
         with shelve.open('.em') as emdb:
             if EM_KEY not in emdb:
-                curdir = os.path.abspath('.')
+                curdir = osp.abspath('.')
                 return _die(E_NO_PROJ.format(curdir))
         cb(*args, **kwargs)
     return _docmd
 
 
 def _expath(*args):
-    return os.path.abspath(os.path.join('experiments', *args))
+    return osp.abspath(osp.join('experiments', *args))
 
 
 def proj_create(args, config, _extra_args):
@@ -67,25 +68,25 @@ def proj_create(args, config, _extra_args):
         pygit2.clone_repository(tmpl_repo, args.dest)
 
         # delete history of template
-        shutil.rmtree(os.path.join(args.dest, '.git'), ignore_errors=True)
+        shutil.rmtree(osp.join(args.dest, '.git'), ignore_errors=True)
         pygit2.init_repository(args.dest)
     except ValueError:
         pass  # already in a repo
 
     for em_dir in ['experiments', 'data']:
-        dpath = os.path.join(args.dest, em_dir)
-        if not os.path.isdir(dpath):
+        dpath = osp.join(args.dest, em_dir)
+        if not osp.isdir(dpath):
             os.mkdir(dpath)
 
-    with shelve.open(os.path.join(args.dest, '.em')) as emdb:
+    with shelve.open(osp.join(args.dest, '.em')) as emdb:
         emdb['__em__'] = {}
 
 
 def _cleanup(name, emdb, repo):
     exper_dir = _expath(name)
-    if name not in emdb and not os.path.isdir(exper_dir):
+    if name not in emdb and not osp.isdir(exper_dir):
         return
-    if os.path.isdir(exper_dir):
+    if osp.isdir(exper_dir):
         shutil.rmtree(exper_dir)
     try:
         worktree = repo.lookup_worktree(name)
@@ -93,8 +94,8 @@ def _cleanup(name, emdb, repo):
             worktree.prune(True)
     except pygit2.GitError:
         pass
-        # worktree_dir = os.path.join('.git', 'worktrees', name)
-        # if os.path.isdir(worktree_dir):
+        # worktree_dir = osp.join('.git', 'worktrees', name)
+        # if osp.isdir(worktree_dir):
         #     shutil.rmtree(exper_dir)
     try:
         br = repo.lookup_branch(name)
@@ -108,8 +109,8 @@ def _cleanup(name, emdb, repo):
 
 def _cleanup_snaps(name, _emdb, _repo):
     exper_dir = _expath(name)
-    snaps_dir = os.path.join(exper_dir, 'run', 'snaps')
-    if os.path.isdir(snaps_dir):
+    snaps_dir = osp.join(exper_dir, 'run', 'snaps')
+    if osp.isdir(snaps_dir):
         shutil.rmtree(snaps_dir)
         os.mkdir(snaps_dir)
 
@@ -119,19 +120,22 @@ def _tstamp():
     return datetime.datetime.fromtimestamp(time.time())
 
 
+def _get_tracked_exts(config):
+    return set(config['experiment']['track_files'].split(','))
+
 def _has_src_changes(repo, config):
-    tracked_exts = set(config['experiment']['track_files'].split(','))
     has_src_changes = has_changes = False
     for filepath, status in repo.status().items():
-        ext = os.path.splitext(os.path.basename(filepath))[1][1:]
+        ext = osp.splitext(osp.basename(filepath))[1][1:]
         changed = status not in GIT_UNCH
         has_changes = has_changes or changed
-        if ext in tracked_exts:
+        if ext in _get_tracked_exts(config):
             has_src_changes = has_src_changes or changed
     return has_src_changes
 
 
 def _create_experiment(name, repo, config, base_commit=None, desc=None):
+    # pylint: disable=too-many-locals
     head_commit = repo[repo.head.target]
     stash = None
     sig = repo.default_signature
@@ -139,8 +143,7 @@ def _create_experiment(name, repo, config, base_commit=None, desc=None):
     has_src_changes = _has_src_changes(repo, config)
 
     if has_src_changes:
-        tracked_exts = set(config['experiment']['track_files'].split(','))
-        repo.index.add_all([f'*.{ext}' for ext in tracked_exts])
+        repo.index.add_all([f'*.{ext}' for ext in _get_tracked_exts(config)])
         snap_tree_id = repo.index.write_tree()  # an Oid
 
         if base_commit is not None:
@@ -169,14 +172,14 @@ def _create_experiment(name, repo, config, base_commit=None, desc=None):
 
     if has_src_changes and base_commit == head_commit:
         # create a snapshot and move the worktree branch to it
-        msg = desc or 'setup experiment'
-        repo.create_commit(f'refs/heads/{name}', sig, sig, msg,
+        repo.create_commit(f'refs/heads/{name}', sig, sig,
+                           desc or 'setup experiment',
                            snap_tree_id, [base_commit.id])
         # update the workdir to match updated index
         workdir = pygit2.Repository(exper_dir)
         workdir.reset(workdir.head.target, pygit2.GIT_RESET_HARD)
 
-    os.symlink(os.path.abspath('data'), os.path.join(exper_dir, 'data'),
+    os.symlink(osp.abspath('data'), osp.join(exper_dir, 'data'),
                target_is_directory=True)
 
     if base_commit != head_commit:
@@ -227,7 +230,7 @@ def _run_job(name, config, gpu=None, prog_args=None, background=False):
                 emdb[name]['ended'] = _tstamp()
 
     if background:
-        curdir = os.path.abspath(os.curdir)
+        curdir = osp.abspath(os.curdir)
         with daemon.DaemonContext(working_directory=curdir):
             _do_run_job()
     else:
@@ -268,7 +271,7 @@ def run(args, config, prog_args):
     return _run_job(name, config, args.gpu, prog_args, args.background)
 
 
-def fork(args, config, prog_args):
+def fork(args, config, _extra_args):
     """Fork an experiment."""
     name = args.name
     fork_name = args.fork_name
@@ -304,13 +307,11 @@ def fork(args, config, prog_args):
     base_commit = repo[br.target]
     _create_experiment(fork_name, repo, config, base_commit)
 
-    orig_dir = _expath(name)
-    fork_dir = _expath(fork_name)
-    fork_snap_dir = os.path.join(fork_dir, 'run', 'snaps')
+    fork_snap_dir = osp.join(_expath(fork_name), 'run', 'snaps')
     os.makedirs(fork_snap_dir)
 
     def _link(*path_comps):
-        orig_path = os.path.join(orig_dir, *path_comps)
+        orig_path = osp.join(_expath(name), *path_comps)
         os.symlink(orig_path, orig_path.replace(name, fork_name))
 
     _link('run', 'opts.pkl')
@@ -376,17 +377,16 @@ def clean(args, _config, _extra_args):
             cleanup(args.name[0], emdb, repo)
             return
 
-        if to_clean:
-            print(CLEAN_SNAP_PREAMBLE if args.snaps else CLEAN_PREAMBLE)
-            _print_sorted(clean_noforce)
-            if args.force:
-                _print_sorted(needs_force, tmpl=LI_RUNNING)
-        if needs_force and not args.force:
-            print(CLEAN_NEEDS_FORCE)
-            _print_sorted(needs_force)
-
         if not to_clean:
             return
+
+        print(CLEAN_SNAP_PREAMBLE if args.snaps else CLEAN_PREAMBLE)
+        _print_sorted(clean_noforce)
+        if args.force:
+            _print_sorted(needs_force, tmpl=LI_RUNNING)
+        elif needs_force:
+            print(CLEAN_NEEDS_FORCE)
+            _print_sorted(needs_force)
 
         prompt = CLEAN_SNAPS_PROMPT if args.snaps else CLEAN_PROMPT
         cleanp = input(prompt.format(len(to_clean)))
@@ -432,10 +432,10 @@ def reset(args, _config, _extra_args):
             _reset(name)
 
 
-def list_experiments(args, _config, _extra_args):
+def list_experiments(_args, _config, extra_args):
     """List experiments."""
     import subprocess
-    subprocess.call(['ls', 'experiments'] + _extra_args)
+    subprocess.call(['ls', 'experiments'] + extra_args)
 
 
 def show(args, _config, _extra_args):
@@ -571,7 +571,7 @@ def main():
 
     parser_run = subparsers.add_parser('fork', help='fork an experiment')
     parser_run.add_argument('name', help='the name of the experiment to clone')
-    parser_run.add_argument('fork_name', help='the name of the cloned experiment')
+    parser_run.add_argument('fork_name', help='name for the cloned experiment')
     parser_run.set_defaults(em_cmd=_ensure_proj(fork))
 
 
