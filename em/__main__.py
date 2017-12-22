@@ -432,10 +432,28 @@ def reset(args, _config, _extra_args):
             _reset(name)
 
 
-def list_experiments(_args, _config, extra_args):
+def list_experiments(args, _config, _extra_args):
     """List experiments."""
     import subprocess
-    subprocess.call(['ls', 'experiments'] + extra_args)
+
+    if args.filter:
+        filter_key, filter_value = args.filter.split('=')
+
+        def _filt(stats):
+            return filter_key in stats and stats[filter_key] == filter_value
+
+    with shelve.open('.em') as emdb:
+        if args.filter:
+            names = {name
+                     for name, info in sorted(emdb.items()) if _filt(info)}
+        else:
+            names = emdb.keys()
+        names -= {EM_KEY}
+        if not names:
+            return
+
+    subprocess.run(
+        ['column'], input='\n'.join(sorted(names)) + '\n', encoding='utf8')
 
 
 def show(args, _config, _extra_args):
